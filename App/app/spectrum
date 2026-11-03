@@ -1,0 +1,89 @@
+--- repo-pkg/App/app/spectrum.c	2026-11-02 17:47:16.228914650 +0000
++++ repo-step/App/app/spectrum.c	2026-11-03 17:29:32.737706169 +0000
+@@ -82,7 +82,7 @@
+ 
+ SpectrumSettings settings = {.stepsCount = STEPS_64,
+                              .scanStepIndex = S_STEP_25_0kHz,
+-                             .frequencyChangeStep = 80000,
++                             .frequencyChangeStep = 1000,
+                              .scanDelay = 3200,
+                              .rssiTriggerLevel = 150,
+                              .backlightState = true,
+@@ -610,6 +610,26 @@
+ #endif
+ 
+ uint32_t GetBW() { return GetStepsCount() * GetScanStep(); }
++
++/* Passo UP/DOWN in unita' da 10 Hz (1 unita' = 0,01 kHz).
++ * Intervallo: 0,01 kHz (1) .. 100,00 kHz (10000).
++ * Passi decimali: 0,01 kHz sotto 1 kHz, 0,1 kHz sotto 10 kHz, 1 kHz sopra. */
++#define FREQ_CHANGE_STEP_MIN 1u
++#define FREQ_CHANGE_STEP_MAX 10000u
++
++static uint32_t FreqChangeLadderStep(uint32_t v)
++{
++    if (v < 100u)  return 1u;
++    if (v < 1000u) return 10u;
++    return 100u;
++}
++
++static uint32_t ClampFrequencyChangeStep(uint32_t v)
++{
++    if (v < FREQ_CHANGE_STEP_MIN) return FREQ_CHANGE_STEP_MIN;
++    if (v > FREQ_CHANGE_STEP_MAX) return FREQ_CHANGE_STEP_MAX;
++    return v;
++}
+ uint32_t GetFStart()
+ {
+     return IsCenterMode() ? currentFreq - (GetBW() >> 1) : currentFreq;
+@@ -988,7 +1008,7 @@
+     autoNoiseFloor = RSSI_MAX_VALUE;
+ 
+     // Keep frequency/range unchanged; recompute move step from fresh scan params.
+-    settings.frequencyChangeStep = GetBW() >> 1;
++    settings.frequencyChangeStep = ClampFrequencyChangeStep(GetBW() >> 1);
+ 
+     RADIO_SetModulation(settings.modulationType);
+     BK4819_SetFilterBandwidth(settings.listenBw, false);
+@@ -1076,7 +1096,7 @@
+         settings.scanStepIndex = settings.scanStepIndex != 0 ? settings.scanStepIndex - 1 : S_STEP_100_0kHz;
+     }
+ 
+-    settings.frequencyChangeStep = GetBW() >> 1;
++    settings.frequencyChangeStep = ClampFrequencyChangeStep(GetBW() >> 1);
+     RelaunchScan();
+     ResetBlacklist();
+     redrawScreen = true;
+@@ -1145,15 +1165,18 @@
+ 
+ static void UpdateFreqChangeStep(bool inc)
+ {
+-    uint16_t diff = GetScanStep() * 4;
+-    if (inc && settings.frequencyChangeStep < 200000)
++    uint32_t v = settings.frequencyChangeStep;
++    if (inc)
+     {
+-        settings.frequencyChangeStep += diff;
++        if (v < FREQ_CHANGE_STEP_MAX)
++            v += FreqChangeLadderStep(v);
+     }
+-    else if (!inc && settings.frequencyChangeStep > 10000)
++    else
+     {
+-        settings.frequencyChangeStep -= diff;
++        if (v > FREQ_CHANGE_STEP_MIN)
++            v -= FreqChangeLadderStep(v - 1u);
+     }
++    settings.frequencyChangeStep = ClampFrequencyChangeStep(v);
+     SYSTEM_DelayMs(100);
+     redrawScreen = true;
+ }
+@@ -1223,7 +1246,7 @@
+     {
+         settings.stepsCount--;
+     }
+-    settings.frequencyChangeStep = GetBW() >> 1;
++    settings.frequencyChangeStep = ClampFrequencyChangeStep(GetBW() >> 1);
+     RelaunchScan();
+     ResetBlacklist();
+     redrawScreen = true;
