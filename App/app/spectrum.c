@@ -82,7 +82,7 @@ const uint8_t modTypeReg47Values[] = {1, 7, 5};
 
 SpectrumSettings settings = {.stepsCount = STEPS_64,
                              .scanStepIndex = S_STEP_25_0kHz,
-                             .frequencyChangeStep = 80000,
+                             .frequencyChangeStep = 1000,
                              .scanDelay = 3200,
                              .rssiTriggerLevel = 150,
                              .backlightState = true,
@@ -101,6 +101,12 @@ static uint8_t  peakHoldY[128];       // Peak Y value per display column (0=top)
 static uint8_t  peakHoldAge[64];      // Shared decay timer (1 per 2 columns)
 #define PEAK_HOLD_DELAY  15           // Sweeps before decay starts
 #define PEAK_HOLD_INIT   0xFF         // "no peak" sentinel (same as SPECTRUM_TOPY_SKIP)
+
+// Require a peak to persist across consecutive scan passes before opening RX.
+#define PEAK_CONFIRM_HITS 2
+#define PEAK_CONFIRM_TOL  2           // Maximum bin movement between confirmations
+static uint8_t peakConfirmHits = 0;
+static uint16_t peakConfirmIndex = 0;
 
 // Cached REG_30 value for scan steps: avoids re-reading it on every SetFScan()
 // call (saves 1 SPI read per step = fewer SPI bus events = less SPI-induced audio interference).
@@ -485,6 +491,48 @@ static bool IsPeakOverOpenLevel()
     return peak.rssi >= openLevel;
 }
 
+// Scan-only confirmation: leave STILL/monitor trigger behaviour unchanged.
+static bool IsPeakConfirmedForScan()
+{
+    uint16_t openLevel = settings.rssiTriggerLevel;
+    if (openLevel <= (uint16_t)(RSSI_MAX_VALUE - LISTEN_OPEN_HYST_RSSI))
+        openLevel += LISTEN_OPEN_HYST_RSSI;
+    else
+        openLevel = RSSI_MAX_VALUE;
+
+    // Use this completed scan's maximum, not the display peak which may be
+    // retained from an earlier sweep.
+    if (scanInfo.rssiMax < openLevel)
+    {
+        peakConfirmHits = 0;
+        return false;
+    }
+
+    uint16_t distance = (scanInfo.iPeak > peakConfirmIndex)
+                            ? (uint16_t)(scanInfo.iPeak - peakConfirmIndex)
+                            : (uint16_t)(peakConfirmIndex - scanInfo.iPeak);
+
+    if (peakConfirmHits == 0 || distance > PEAK_CONFIRM_TOL)
+    {
+        peakConfirmIndex = scanInfo.iPeak;
+        peakConfirmHits = 1;
+    }
+    else if (peakConfirmHits < PEAK_CONFIRM_HITS)
+    {
+        ++peakConfirmHits;
+    }
+
+    if (peakConfirmHits < PEAK_CONFIRM_HITS)
+        return false;
+
+    // Tune to the peak confirmed in the current completed sweep.
+    peak.t = 0;
+    peak.rssi = scanInfo.rssiMax;
+    peak.f = NormalizeScanFrequency(scanInfo.fPeak);
+    peak.i = scanInfo.iPeak;
+    return true;
+}
+
 static bool IsListeningSignalPresent(uint16_t rssi)
 {
     uint16_t closeLevel = (settings.rssiTriggerLevel > LISTEN_CLOSE_HYST_RSSI)
@@ -499,6 +547,8 @@ static void ResetPeak()
     peak.rssi = 0;
     peak.f = 0;
     peak.i = 0;
+    peakConfirmHits = 0;
+    peakConfirmIndex = 0;
 }
 
 #ifdef ENABLE_FEAT_F4HWN_SPECTRUM
@@ -560,6 +610,26 @@ static uint16_t GetStepsCountDisplay()
 #endif
 
 uint32_t GetBW() { return GetStepsCount() * GetScanStep(); }
+
+/* Passo UP/DOWN in unita' da 10 Hz (1 unita' = 0,01 kHz).
+ * Intervallo: 0,01 kHz (1) .. 100,00 kHz (10000).
+ * Passi decimali: 0,01 kHz sotto 1 kHz, 0,1 kHz sotto 10 kHz, 1 kHz sopra. */
+#define FREQ_CHANGE_STEP_MIN 1u
+#define FREQ_CHANGE_STEP_MAX 10000u
+
+static uint32_t FreqChangeLadderStep(uint32_t v)
+{
+    if (v < 100u)  return 1u;
+    if (v < 1000u) return 10u;
+    return 100u;
+}
+
+static uint32_t ClampFrequencyChangeStep(uint32_t v)
+{
+    if (v < FREQ_CHANGE_STEP_MIN) return FREQ_CHANGE_STEP_MIN;
+    if (v > FREQ_CHANGE_STEP_MAX) return FREQ_CHANGE_STEP_MAX;
+    return v;
+}
 uint32_t GetFStart()
 {
     return IsCenterMode() ? currentFreq - (GetBW() >> 1) : currentFreq;
@@ -938,7 +1008,7 @@ static void ResetSpectrumToDefaults()
     autoNoiseFloor = RSSI_MAX_VALUE;
 
     // Keep frequency/range unchanged; recompute move step from fresh scan params.
-    settings.frequencyChangeStep = GetBW() >> 1;
+    settings.frequencyChangeStep = ClampFrequencyChangeStep(GetBW() >> 1);
 
     RADIO_SetModulation(settings.modulationType);
     BK4819_SetFilterBandwidth(settings.listenBw, false);
@@ -1026,7 +1096,7 @@ static void UpdateScanStep(bool inc)
         settings.scanStepIndex = settings.scanStepIndex != 0 ? settings.scanStepIndex - 1 : S_STEP_100_0kHz;
     }
 
-    settings.frequencyChangeStep = GetBW() >> 1;
+    settings.frequencyChangeStep = ClampFrequencyChangeStep(GetBW() >> 1);
     RelaunchScan();
     ResetBlacklist();
     redrawScreen = true;
@@ -1095,15 +1165,18 @@ static void ResumeSweepInDirection(bool forward)
 
 static void UpdateFreqChangeStep(bool inc)
 {
-    uint16_t diff = GetScanStep() * 4;
-    if (inc && settings.frequencyChangeStep < 200000)
+    uint32_t v = settings.frequencyChangeStep;
+    if (inc)
     {
-        settings.frequencyChangeStep += diff;
+        if (v < FREQ_CHANGE_STEP_MAX)
+            v += FreqChangeLadderStep(v);
     }
-    else if (!inc && settings.frequencyChangeStep > 10000)
+    else
     {
-        settings.frequencyChangeStep -= diff;
+        if (v > FREQ_CHANGE_STEP_MIN)
+            v -= FreqChangeLadderStep(v - 1u);
     }
+    settings.frequencyChangeStep = ClampFrequencyChangeStep(v);
     SYSTEM_DelayMs(100);
     redrawScreen = true;
 }
@@ -1173,7 +1246,7 @@ static void ToggleStepsCount()
     {
         settings.stepsCount--;
     }
-    settings.frequencyChangeStep = GetBW() >> 1;
+    settings.frequencyChangeStep = ClampFrequencyChangeStep(GetBW() >> 1);
     RelaunchScan();
     ResetBlacklist();
     redrawScreen = true;
@@ -2291,7 +2364,7 @@ static void UpdateScan()
         preventKeypress = false;
 
         UpdatePeakInfo();
-        if (IsPeakOverOpenLevel())
+        if (IsPeakConfirmedForScan())
         {
             ToggleRX(true);
             TuneToPeak();
@@ -2320,23 +2393,24 @@ static void UpdateScan()
     preventKeypress = false;
 
     UpdatePeakInfo();
-    if (IsPeakOverOpenLevel())
-    {
-        ToggleRX(true);
-        TuneToPeak();
-        return;
-    }
 
     if (scanReturnPending)
     {
-        // Finish the opposite half-sweep before finalizing this cycle.
+        // Finish the opposite half-sweep before evaluating one full scan.
         scanReturnPending = false;
         scanForward = !scanForward;
         NextScanStep();
         return;
     }
 
-    // Full round trip done.
+    // Full round trip done: only complete round trips count as confirmations.
+    if (IsPeakConfirmedForScan())
+    {
+        ToggleRX(true);
+        TuneToPeak();
+        return;
+    }
+
     FinalizeCompletedSweep();
 }
 
