@@ -1,0 +1,54 @@
+name: Build UV-K1 / UV-K5 V3 firmware
+
+on:
+  workflow_dispatch:
+    inputs:
+      preset:
+        description: "Preset di build (Fusion, Transfer, FieldOps, Labs, Custom, All)"
+        required: true
+        default: "Fusion"
+        type: choice
+        options: [Fusion, Transfer, FieldOps, Labs, Custom, All]
+  push:
+    branches: [main]
+    paths-ignore: ["**.md", "wiki/**"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Scegli preset
+        id: preset
+        run: echo "name=${{ inputs.preset || 'Fusion' }}" >> "$GITHUB_OUTPUT"
+
+      - name: Compila con lo script del repository (Docker)
+        run: ./compile-firmware.sh "${{ steps.preset.outputs.name }}"
+
+      - name: Verifica che esista almeno un BIN
+        run: |
+          set -e
+          count=$(find build -name '*.bin' | wc -l)
+          echo "File BIN trovati: $count"
+          test "$count" -gt 0
+          find build -name '*.bin' -exec ls -l {} \;
+
+      - name: Calcola SHA-256
+        run: find build -name '*.bin' -exec sha256sum {} \; | tee build/SHA256SUMS.txt
+
+      - name: Carica artefatto BIN
+        uses: actions/upload-artifact@v4
+        with:
+          name: uvk1-uvk5v3-firmware-${{ steps.preset.outputs.name }}-${{ github.sha }}
+          path: |
+            build/**/*.bin
+            build/**/*.hex
+            build/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
