@@ -83,7 +83,7 @@ const uint8_t modTypeReg47Values[] = {1, 7, 5};
 SpectrumSettings settings = {.stepsCount = STEPS_64,
                              .scanStepIndex = S_STEP_25_0kHz,
                              .frequencyChangeStep = 1000,
-                             .scanDelay = 3200,
+                             .scanDelay = 0,
                              .rssiTriggerLevel = 150,
                              .backlightState = true,
                              .bw = BK4819_FILTER_BW_WIDE,
@@ -167,6 +167,20 @@ static AutoSensitivityProfile autoSensitivity = AUTO_SENS_NORMAL;
 #define LISTEN_RELEASE_LOW_COUNT 4   // consecutive low reads before release
 #define LISTEN_DROP_EXIT_RSSI   20   // 10 dB abrupt drop => leave RX
 static uint8_t listenLowCount = 0;
+// Turbo scan: skip the discarded first RSSI read per step (faster, less accurate).
+static bool scanTurbo = false;
+// Option menu, opened with the M key (cycles: closed -> MODE -> TURBO -> DELAY -> closed).
+// UP/DOWN change the value of the selected option; EXIT closes the menu first.
+#define OPT_MENU_OFF    0
+#define OPT_MENU_MODE   1
+#define OPT_MENU_TURBO  2
+#define OPT_MENU_DELAY  3
+#define OPT_MENU_ECO    4
+static uint8_t optMenu = OPT_MENU_OFF;
+// ECO: scan moves one step every other tick (slower, fewer measurements, less CPU work).
+static bool scanEco = false;
+static uint8_t ecoTick = 0;
+static const uint16_t scanDelayChoices[] = {0, 50, 100, 200, 400, 800, 1600, 2540};
 static uint16_t listenPrevRssi = RSSI_MAX_VALUE;
 static uint16_t autoNoiseFloor = RSSI_MAX_VALUE;
 
@@ -247,7 +261,16 @@ static void LoadSettings()
     // Data[3]: rssiTriggerLevel as uint8_t (0xFF = auto)
     settings.rssiTriggerLevel = (Data[3] == 0xFF) ? RSSI_MAX_VALUE : Data[3];
 
-    // Data[4] ~ Data[7] are free (for the moment...)
+    // Data[4]: scanDelay in units of 10 us (0xFF = erased = 0)
+    settings.scanDelay = (Data[4] == 0xFF) ? 0u : (uint16_t)Data[4] * 10u;
+
+    // Data[5]: turbo flag, only exactly 1 means on (0xFF = erased = off)
+    scanTurbo = (Data[5] == 1u);
+
+    // Data[6]: ECO flag (only exactly 1 means on)
+    scanEco = (Data[6] == 1u);
+
+    // Data[7] is free (for the moment...)
 }
 
 static void SaveSettings()
@@ -266,6 +289,17 @@ static void SaveSettings()
 
     // Data[3]: rssiTriggerLevel as uint8_t (0xFF = auto)
     Data[3] = (settings.rssiTriggerLevel == RSSI_MAX_VALUE) ? 0xFF : (uint8_t)settings.rssiTriggerLevel;
+
+    // Data[4]: scanDelay in units of 10 us. Max 2540 us (254 units): 255 (0xFF)
+    // is the erased-flash marker and must never be written as a real value.
+    uint16_t delay = (settings.scanDelay > 2540u) ? 2540u : settings.scanDelay;
+    Data[4] = (uint8_t)(delay / 10u);
+
+    // Data[5]: turbo flag
+    Data[5] = scanTurbo ? 1u : 0u;
+
+    // Data[6]: ECO flag
+    Data[6] = scanEco ? 1u : 0u;
 
     PY25Q16_WriteBuffer(0x00A148, Data, sizeof(Data), false);
 }
@@ -674,8 +708,10 @@ uint16_t GetRssi()
     {
         SYSTICK_DelayUs(1);
     }
-    // Discard first read (AGC may still be transitioning), keep second
-    BK4819_GetRSSI();
+    // Discard first read (AGC may still be transitioning), keep second.
+    // Turbo skips the discarded read: one SPI transaction less per step.
+    if (!scanTurbo)
+        BK4819_GetRSSI();
     uint16_t rssi = BK4819_GetRSSI();
     return rssi;
 }
@@ -998,6 +1034,7 @@ static void ResetSpectrumToDefaults()
     autoSensitivity = AUTO_SENS_NORMAL;
     monitorMode = false;
     menuState = 0;
+    optMenu = OPT_MENU_OFF;
     lockAGC = false;
 
     settings.scanStepIndex = S_STEP_25_0kHz;
@@ -1006,6 +1043,10 @@ static void ResetSpectrumToDefaults()
     settings.modulationType = gTxVfo->Modulation;
     settings.rssiTriggerLevel = RSSI_MAX_VALUE;
     autoNoiseFloor = RSSI_MAX_VALUE;
+    settings.scanDelay = 0;
+    scanTurbo = false;
+    scanEco = false;
+    ecoTick = 0;
 
     // Keep frequency/range unchanged; recompute move step from fresh scan params.
     settings.frequencyChangeStep = ClampFrequencyChangeStep(GetBW() >> 1);
@@ -1615,7 +1656,15 @@ static void BuildCurrentSpectrumTopY(uint8_t *topY)
 
 static void DrawStatus()
 {
-    if (manualSetFlag)
+    if (optMenu == OPT_MENU_MODE)
+        sprintf(String, "MODE %s", manualSetFlag ? "MAN" : "AUTO");
+    else if (optMenu == OPT_MENU_TURBO)
+        sprintf(String, "TURBO %s", scanTurbo ? "ON" : "OFF");
+    else if (optMenu == OPT_MENU_DELAY)
+        sprintf(String, "DELAY %u", settings.scanDelay);
+    else if (optMenu == OPT_MENU_ECO)
+        sprintf(String, "ECO %s", scanEco ? "ON" : "OFF");
+    else if (manualSetFlag)
     {
         char curStr[6];
         char trigStr[6];
@@ -1640,6 +1689,20 @@ static void DrawStatus()
     }
     
     GUI_DisplaySmallest(String, 0, 1, true, true);
+
+    // Indicators outside the option menu: T = turbo on, D<us> = delay set
+    if (optMenu == OPT_MENU_OFF)
+    {
+        if (scanTurbo)
+            GUI_DisplaySmallest("T", 72, 1, true, true);
+        if (scanEco)
+            GUI_DisplaySmallest("E", 80, 1, true, true);
+        if (settings.scanDelay)
+        {
+            sprintf(String, "D%u", settings.scanDelay);
+            GUI_DisplaySmallest(String, 88, 1, true, true);
+        }
+    }
 
     BOARD_ADC_GetBatteryInfo(&gBatteryVoltages[gBatteryCheckCounter++ % 4],
                              &gBatteryCurrent);
@@ -1718,7 +1781,7 @@ static void DrawF(uint32_t f)
     FormatFrequency(f, String);
     // Align frequency with channel name in status bar (both at x=43).
     // Left-aligned (End == Start = 43) so it does not collide with BW at x=108.
-    UI_PrintStringSmallNormal(String, 43, 43, 0);
+    UI_PrintStringSmallBold(String, 43, 43, 0);
 
     sprintf(String, "%3s", gModulationStr[settings.modulationType]);
     GUI_DisplaySmallest(String, 116, 1, false, true);
@@ -1903,6 +1966,48 @@ static bool OnKeyDownCommon(uint8_t key) {
     return false;
 }
 
+// Returns true on ticks that must be skipped while ECO is on (every other tick).
+static bool EcoSkipTick(void)
+{
+    if (!scanEco)
+        return false;
+    ecoTick++;
+    return (ecoTick & 1u) != 0;
+}
+
+static void ChangeOption(bool inc)
+{
+    if (optMenu == OPT_MENU_MODE)
+    {
+        manualSetFlag = inc;                 // UP = manual, DOWN = auto
+        if (!manualSetFlag)
+            settings.rssiTriggerLevel = RSSI_MAX_VALUE;
+    }
+    else if (optMenu == OPT_MENU_TURBO)
+    {
+        scanTurbo = inc;                     // UP = on, DOWN = off
+    }
+    else if (optMenu == OPT_MENU_DELAY)
+    {
+        uint8_t n = ARRAY_SIZE(scanDelayChoices);
+        uint8_t i = 0;
+        while (i < n && scanDelayChoices[i] != settings.scanDelay)
+            i++;
+        if (i >= n)
+            i = 0;
+        if (inc && i + 1 < n)
+            i++;
+        else if (!inc && i > 0)
+            i--;
+        settings.scanDelay = scanDelayChoices[i];
+    }
+    else if (optMenu == OPT_MENU_ECO)
+    {
+        scanEco = inc;                       // UP = on, DOWN = off
+    }
+    redrawStatus = true;
+}
+
 static void OnKeyDown(uint8_t key) {
     bool isTrue = (key == KEY_1 || key == KEY_2);
 
@@ -1918,6 +2023,11 @@ static void OnKeyDown(uint8_t key) {
         break;
     case KEY_UP:
     case KEY_DOWN:
+        if (optMenu)
+        {
+            ChangeOption(GetDirection(key));
+            break;
+        }
         // If the spectrum is currently receiving (green LED on),
         // force-stop RX and restart sweep in the requested direction.
         if (isListening) {
@@ -1952,13 +2062,17 @@ static void OnKeyDown(uint8_t key) {
         TuneToPeak();
         break;
     case KEY_MENU:
-        // Short press toggles manual/auto.
-        manualSetFlag = !manualSetFlag;
-        if (!manualSetFlag)
-            settings.rssiTriggerLevel = RSSI_MAX_VALUE;
+        // Short press cycles the option menu: closed -> MODE -> TURBO -> DELAY -> ECO -> closed
+        optMenu = (optMenu >= OPT_MENU_ECO) ? OPT_MENU_OFF : optMenu + 1;
         redrawStatus = true;
         break;
     case KEY_EXIT:
+        if (optMenu)
+        {
+            optMenu = OPT_MENU_OFF;
+            redrawStatus = true;
+            break;
+        }
         if (menuState)
         {
             menuState = 0;
@@ -2269,6 +2383,9 @@ static void Scan()
     )
     {
         SetFScan(scanInfo.f);
+        // Per-step dwell (Delay), in microseconds. 0 = stock timing.
+        if (settings.scanDelay)
+            SYSTICK_DelayUs(settings.scanDelay);
         Measure();
         UpdateScanInfo();
     }
@@ -2347,6 +2464,9 @@ static void FinalizeCompletedSweep()
 
 static void UpdateScan()
 {
+    if (EcoSkipTick())
+        return;
+
     Scan();
 
 #if SPECTRUM_INTERLACE_LARGE_SWEEPS
